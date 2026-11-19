@@ -171,6 +171,19 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 _BIND_ATTEMPTS = 5  # EADDRINUSE retries while a restart's predecessor releases the port (#91547)
 
+# Listener watchdog. aiohttp's accept loop can die and never come back: on Windows
+# (Proactor) ``IocpProactor.accept`` surfaces OSError[WinError 64] ERROR_NETNAME_DELETED,
+# asyncio logs "Accept failed on a socket" and then posts no further accepts. The
+# socket stays bound and the process stays alive, so TCP handshakes still complete
+# into the listen backlog while nothing is ever served -- clients hang instead of
+# being refused, and every probe of /health returns nothing. Nothing in the adapter
+# ever noticed, so the gateway stayed "up" and unreachable indefinitely.
+# Probe our own listener and rebind it when it stops answering.
+_LISTENER_PROBE_INTERVAL = 20.0
+_LISTENER_PROBE_TIMEOUT = 5.0
+_LISTENER_LOOP_LAG_LIMIT = 2.0  # a starved event loop is not a dead listener
+_LISTENER_FAILURES_BEFORE_REBIND = 3
+
 
 def listen_address(extra: dict[str, Any]) -> tuple[str, int]:
     """Host/port the adapter binds: config.yaml ``platforms.api_server`` wins over the env fallbacks.
@@ -1095,6 +1108,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._app: Optional[web.Application] = None
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
+        self._listener_watchdog_task: Optional[asyncio.Task] = None
+        self._listener_failures = 0
         from hermes_constants import get_hermes_home
         self._response_store = ResponseStore()  # this home's; a /p/<profile>/ route gets its own
         self._response_store_home = str(get_hermes_home())
@@ -4019,6 +4034,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # heartbeat loop updates last_heartbeat/metrics_today (#52323).
             self._publish_runtime_status()
             self._track_background_task(asyncio.create_task(self._heartbeat_loop()))
+            self._listener_failures = 0
+            # start() is idempotent for the rest of the adapter; the watchdog must be
+            # too, or a second start() leaves two loops polling the same port.
+            if self._listener_watchdog_task is not None and not self._listener_watchdog_task.done():
+                self._listener_watchdog_task.cancel()
+            self._listener_watchdog_task = asyncio.create_task(self._listener_watchdog_loop())
+            self._track_background_task(self._listener_watchdog_task)
             logger.info(
                 "[%s] API server listening on http://%s:%d (model: %s)",
                 self.name, self._host, self._port, self._model_name)
@@ -4026,6 +4048,109 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         except Exception as e:
             logger.error("[%s] Failed to start API server: %s", self.name, e)
             return False
+
+    async def _listener_responds(self) -> bool:
+        """True when our own listener answers *anything* over HTTP.
+
+        A bare connect() is not enough to tell a live listener from a dead one: when
+        the accept loop dies the kernel still completes handshakes into the backlog,
+        so a TCP probe succeeds against a server that will never reply. Reading at
+        least one byte of a response is the signal that something is actually serving.
+        """
+        from gateway.platforms.shared_ingress import is_wildcard_host
+
+        host = "127.0.0.1" if is_wildcard_host(self._host) else self._host
+        writer = None
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, self._port), _LISTENER_PROBE_TIMEOUT)
+            # Any HTTP status counts, including 401/404 -- we are asking whether the
+            # stack answers at all, not whether this synthetic request is authorized.
+            writer.write(
+                b"GET /health HTTP/1.1\r\nHost: listener-probe\r\n"
+                b"Connection: close\r\n\r\n")
+            await asyncio.wait_for(writer.drain(), _LISTENER_PROBE_TIMEOUT)
+            data = await asyncio.wait_for(reader.read(16), _LISTENER_PROBE_TIMEOUT)
+            return bool(data)
+        except (TimeoutError, OSError, asyncio.IncompleteReadError):
+            return False
+        finally:
+            if writer is not None:
+                with suppress(Exception):
+                    writer.close()
+                    await writer.wait_closed()
+
+    @staticmethod
+    async def _event_loop_lag() -> float:
+        """Seconds the loop needed beyond the requested sleep (0.0-ish when healthy)."""
+        started = time.monotonic()
+        await asyncio.sleep(0.05)
+        return max(0.0, time.monotonic() - started - 0.05)
+
+    async def _rebind_listener(self) -> bool:
+        """Rebind the TCP site after the accept loop has died; True on success.
+
+        The dead site cannot be revived -- its accept coroutine raised and its socket
+        is not reachable from here -- so the only way back without restarting the
+        process is to drop it and bind a fresh one.
+        """
+        with suppress(Exception):
+            if self._site:
+                await self._site.stop()
+        self._site = None
+        with suppress(Exception):
+            if self._runner:
+                await self._runner.cleanup()
+        self._runner = None
+
+        for attempt in range(_BIND_ATTEMPTS):
+            try:
+                if self._runner is None:
+                    self._runner = web.AppRunner(self._app)
+                    await self._runner.setup()
+                self._site = await start_tcp_site(self._runner, self._host, self._port, log_tag=self.name)
+                self._publish_runtime_status()
+                return True
+            except OSError as exc:
+                logger.warning(
+                    "[%s] listener rebind attempt %d/%d failed: %s",
+                    self.name, attempt + 1, _BIND_ATTEMPTS, exc)
+                with suppress(Exception):
+                    if self._runner:
+                        await self._runner.cleanup()
+                self._runner = None
+                await asyncio.sleep(0.2 * (attempt + 1))
+        return False
+
+    async def _listener_watchdog_loop(self) -> None:
+        """Keep the listener honest: probe it, rebind it when it stops answering."""
+        while True:
+            await asyncio.sleep(_LISTENER_PROBE_INTERVAL)
+            if not self._site:
+                continue
+            # A loop starved by real work cannot answer the probe either; measuring
+            # first keeps the listener from being blamed for the scheduler.
+            if await self._event_loop_lag() > _LISTENER_LOOP_LAG_LIMIT:
+                continue
+            if await self._listener_responds():
+                self._listener_failures = 0
+                continue
+            self._listener_failures += 1
+            logger.warning(
+                "[%s] listener on %s:%d did not answer its own probe (%d/%d)",
+                self.name, self._host, self._port,
+                self._listener_failures, _LISTENER_FAILURES_BEFORE_REBIND)
+            if self._listener_failures < _LISTENER_FAILURES_BEFORE_REBIND:
+                continue
+            self._listener_failures = 0
+            if await self._rebind_listener():
+                logger.warning(
+                    "[%s] listener rebound on %s:%d after %d failed probes",
+                    self.name, self._host, self._port, _LISTENER_FAILURES_BEFORE_REBIND)
+            else:
+                logger.error(
+                    "[%s] listener could not be rebound on %s:%d -- platform is unreachable",
+                    self.name, self._host, self._port)
 
     async def disconnect(self) -> None:
         """Stop the aiohttp server and release every owned resource, including the ResponseStore
@@ -4038,6 +4163,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         files, #37011).
         """
         self._mark_disconnected()
+        if self._listener_watchdog_task is not None:
+            self._listener_watchdog_task.cancel()
+            # CancelledError is a BaseException since 3.8: suppress(Exception) alone
+            # would let the cancellation escape disconnect().
+            with suppress(asyncio.CancelledError, Exception):
+                await self._listener_watchdog_task
+            self._listener_watchdog_task = None
         # getattr: disconnect() tolerates bare __new__ fixtures (pinned in test_api_server_run_idempotency).
         routed = getattr(self, "_response_stores", {})
         stores = [s for s in (getattr(self, "_response_store", None), *list(routed.values())) if s is not None]
