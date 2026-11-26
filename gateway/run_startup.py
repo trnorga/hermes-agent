@@ -93,11 +93,50 @@ class GatewayStartupMixin:
         """Report the ENFORCED per-turn budget: ``agent.max_turns`` is bridged into
         ``HERMES_MAX_ITERATIONS`` before this runs, so the env slot already carries the config value;
         resolve it the same way the turn loop does (``none``/``unlimited`` spellings included) instead of
-        ``int()`` on the raw string with an invented ``500`` default (#116888)."""
+        ``int()`` on the raw string with an invented ``500`` default (#116888).
+
+        The line names the slot the value came from. Two profiles that both log ``max_iterations=8``
+        are not necessarily configured the same way: one can carry ``agent.max_turns: 8`` while the
+        other carries no key at all and inherits a stale ``HERMES_MAX_ITERATIONS`` from ``.env``. That
+        ambiguity is why a profile can silently drop from 8 turns to 4 when a config write adds an
+        explicit key, and it is unresolvable from a log that only prints the number.
+        """
         from hermes_cli.config import TURN_LIMIT_UNLIMITED, resolve_turn_limit
         limit = resolve_turn_limit(os.getenv("HERMES_MAX_ITERATIONS"))
-        logger.info("Agent budget: max_iterations=%s (agent.max_turns from config.yaml, else the HERMES_MAX_ITERATIONS bridge)",
-                    "unlimited" if limit == TURN_LIMIT_UNLIMITED else limit)
+        logger.info(
+            "Agent budget: max_iterations=%s (source: %s)",
+            "unlimited" if limit == TURN_LIMIT_UNLIMITED else limit,
+            GatewayStartupMixin._agent_budget_source(limit),
+        )
+
+    @staticmethod
+    def _agent_budget_source(enforced: int) -> str:
+        """Name the slot that decided ``enforced`` (``gateway/run.py`` bridges config into env first).
+
+        ``_bridge_max_turns_to_env`` overwrites the env slot whenever ``agent.max_turns`` is present
+        and deletes it when the key is explicitly ``null``; the env value therefore represents a
+        ``.env``/external setting only when the config omits the key entirely. Saying which case
+        applies is the difference between a one-line diagnosis and an open issue.
+        """
+        from hermes_cli.config import resolve_turn_limit
+        env_raw = os.getenv("HERMES_MAX_ITERATIONS")
+        try:
+            from gateway.run import _load_gateway_config
+            agent_cfg = (_load_gateway_config() or {}).get("agent")
+        except Exception:  # a diagnostic must never break startup
+            return f"unknown (config unreadable; HERMES_MAX_ITERATIONS={env_raw!r})"
+        configured = agent_cfg.get("max_turns") if isinstance(agent_cfg, dict) else None
+        if configured is None:
+            if env_raw is None:
+                return "built-in default (no agent.max_turns, no HERMES_MAX_ITERATIONS)"
+            return f"HERMES_MAX_ITERATIONS={env_raw} (.env/external; config.yaml sets no agent.max_turns)"
+        cfg_limit = resolve_turn_limit(configured)
+        if cfg_limit != enforced:
+            # Defensive: the bridge should have made these agree. If they differ, something reset
+            # the env slot after bridging and the config value is NOT what the turn loop enforces.
+            return (f"agent.max_turns={configured!r} in config.yaml, but HERMES_MAX_ITERATIONS="
+                    f"{env_raw!r} is what the turn loop enforces")
+        return f"agent.max_turns={configured!r} in config.yaml"
 
     # A configured platform failed non-retryably this boot and is parked: every "we are serving"
     # status stamp (startup, drain release, scale-to-zero wake) must say ``degraded``, not ``running``.
