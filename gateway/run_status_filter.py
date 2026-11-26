@@ -6,6 +6,10 @@ run /new or /compress. In a DM that reader is the owner and can act; in any shar
 forum, channel, thread, guild, ...) those commands are admin-gated and the token counts and block reason leak
 internal state to every member (#101003). Only complete, unmodified instances of the emit-site template match,
 so similar or user-quoted text is never swallowed.
+
+The iteration-budget notice behaves the same way (#79424): it reports the engine's own tool-call accounting and
+that a summary is being requested. The owner can respond to it by raising ``agent.max_turns``; a member of a
+shared chat can only watch the bot describe its internals. Only the complete emit-site wording matches.
 """
 
 import re
@@ -41,7 +45,19 @@ EMPTY_LADDER_STATUS_PATTERN = (
     r"|repeatedly\s+returning\s+empty\s+content\s+[—-]+\s+skipping\s+further\s+retries"
 )
 
-_DM_ONLY_STATUS_RES = (_template_regex(CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE),)
+# The iteration-budget notice (agent/turn_finalizer.py) is DM-only for the same reason: it
+# reports the engine's own tool-call accounting. Both emit forms are matched — the gateway
+# wording "asking model to summarise" and the CLI wording "requesting summary..." — and the
+# counts stay free-form so raising ``agent.max_turns`` never defeats the match.
+ITERATION_BUDGET_STATUS_PATTERN = (
+    r"(?:⚠\ufe0f?\s*)?Iteration budget exhausted \([\d,]+/[\d,]+\)"
+    r"\s*[—-]+\s*(?:asking model to summari[sz]e|requesting summary\.\.\.)"
+)
+
+_DM_ONLY_STATUS_RES = (
+    _template_regex(CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE),
+    re.compile(ITERATION_BUDGET_STATUS_PATTERN),
+)
 
 
 def status_chat_type(source: Any) -> Any:
